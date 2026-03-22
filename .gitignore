@@ -2,5 +2,6 @@
 .venv/
 __pycache__/
 *.pyc
-data/
+data/*
+!data/verify_*.html
 tokens/
