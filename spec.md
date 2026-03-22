@@ -50,11 +50,14 @@ SwimApp/
 - `sync_activities() -> list[str]` — Connects to Garmin, compares remote activity list against `data/raw/`, downloads missing activities. Returns list of newly downloaded activity IDs. Reuses token caching from `tokens/`.
 
 #### processing.py
-- `categorise_activities(activities: list[dict]) -> None` — Two-pass categorisation. First pass: assign `"interval"`, `"open_water"`, or mark as continuous with a raw distance. Second pass: bucket all continuous swims by distance (see Categorisation section), assigning labels like `"1500m"`, `"1000m"`, or `"other"`. Updates each activity's category in the DB.
-- `extract_continuous_block(lengths: list[dict], target_distance: float, pool_length: float) -> list[dict]` — For activities where the continuous distance is close to but exceeds a target bucket (e.g. 1550m vs 1500m bucket), extract the fastest contiguous block of lengths that sum to the target distance. Returns the trimmed length list.
-- `correct_missed_lengths(lengths: list[dict], pool_length: float) -> list[dict]` — Detects lengths with duration > 1.7x the median, splits them into two lengths with half the duration each. Returns corrected list.
-- `process_activity(filepath: Path) -> dict` — Reads a raw JSON file, applies correction, returns a flat dict ready for DB insertion. Category is assigned later in the batch pass.
-- `process_all_new(activity_ids: list[str]) -> int` — Processes specified activities into the DB, then runs categorisation across all activities. Returns count processed.
+
+The processing pipeline runs in this order: **correct -> categorise -> extract**.
+
+- `correct_missed_lengths(lengths: list[dict], pool_length: float) -> list[dict]` — Detects lengths with duration > 1.7x the median, splits them into two lengths with half the duration each. Returns corrected list. **Runs first** so that categorisation and extraction operate on accurate length counts.
+- `categorise_activities(activities: list[dict]) -> None` — Two-pass categorisation. First pass: assign `"interval"`, `"open_water"`, or mark as continuous candidate with its corrected distance. Second pass: bucket all continuous candidates by distance (see Categorisation section), assigning labels like `"1500m"`, `"1000m"`, or `"other"`. Updates each activity's category in the DB. **Runs second** so distance bucketing uses corrected distances.
+- `extract_continuous_block(lengths: list[dict], target_distance: float, pool_length: float) -> list[dict]` — For activities where the corrected distance exceeds the category target (e.g. 1550m in the 1500m bucket), extract the fastest contiguous block of lengths that sum to the target distance. Returns the trimmed length list. **Runs third** (triggered during pass 2 of categorisation) so it operates on corrected lengths and knows the target distance from bucketing.
+- `process_activity(filepath: Path) -> dict` — Reads a raw JSON file, applies missed-length correction, returns a flat dict ready for DB insertion. Category and block extraction are applied later in the batch pass.
+- `process_all_new(activity_ids: list[str]) -> int` — Orchestrates the full pipeline: for each new activity run `process_activity` (which applies correction), insert into DB, then run `categorise_activities` across all activities (which triggers extraction where needed). Returns count processed.
 
 #### db.py
 - `init_db() -> None` — Creates the SQLite schema if it doesn't exist.
@@ -111,35 +114,45 @@ SwimApp/
 
 Categorisation is a two-pass process across all activities:
 
-**Pass 1 — Type classification:**
+**Pass 1 — Type classification (operates on corrected lengths):**
 1. If `activityType.typeKey == "open_water_swimming"` -> `"open_water"`
-2. If the activity has multiple Garmin laps with DRILL or MIXED stroke types -> `"interval"`
-3. Otherwise -> mark as continuous candidate with its raw distance
+2. If the activity has any Garmin lap with `swimStroke == "DRILL"` -> `"interval"`. Note: only DRILL triggers interval classification. Other stroke types like BUTTERFLY or MIXED after a main set do not — the session should still be categorised by its continuous distance.
+3. Otherwise -> mark as continuous candidate with its corrected distance
 
-**Pass 2 — Distance bucketing (continuous swims only):**
-1. Collect all continuous swim distances.
+**Pass 2 — Distance bucketing (continuous swims only, using corrected distances):**
+1. Collect all continuous swim corrected distances.
 2. Round each distance to the nearest `DISTANCE_MARGIN` (default: 50m, configurable via env var `SWIM_DISTANCE_MARGIN_M`).
 3. Group by rounded distance. Any group with >= `MIN_CATEGORY_COUNT` swims (default: 3, configurable via env var `SWIM_MIN_CATEGORY_COUNT`) becomes its own category, labelled by the target distance (e.g. `"1500m"`, `"1000m"`).
-4. Activities whose rounded distance falls in a valid bucket but whose raw distance exceeds the target: run `extract_continuous_block` to take the fastest contiguous block matching the target, then update the stored lengths and recalculate stats.
+4. Activities whose corrected distance exceeds the bucket target: run `extract_continuous_block` on the already-corrected lengths to take the fastest contiguous block matching the target, then update the stored lengths and recalculate stats.
 5. Activities that don't fit any bucket -> `"other"`.
 
 **Example:** With margin=50m and min_count=3, if there are 40 swims at 1475-1550m, they all bucket to `"1500m"`. The 1550m swims get trimmed to the fastest 60 lengths (60 x 25m = 1500m). If there are only 2 swims at ~1000m, those go to `"other"` until a third appears.
 
-### Fastest Block Extraction
+### Pipeline Order
 
-When a continuous swim's distance exceeds its category target (e.g. 1550m in the 1500m bucket):
-1. Calculate how many lengths make up the target distance: `n = target / pool_length`.
-2. Slide a window of size `n` across the activity's corrected lengths.
-3. Pick the window with the lowest total duration (fastest block).
-4. Store only those lengths (re-indexed from 1) and update the activity's `total_distance_m`, `total_duration_s`, and derived stats.
-5. Preserve `raw_distance_m` as the original distance.
+The three processing stages must run in this order:
 
-### Missed Length Correction
+**Stage 1: Missed Length Correction** (per activity, on ingest)
 
 For each activity's lengths (within a single Garmin lap of active swimming):
 1. Compute the median duration of all lengths in that lap.
 2. If a length's duration > 1.7x the median, replace it with two lengths, each having half the duration and the same distance as the pool length.
 3. Mark the replacement lengths with `is_corrected = True`.
+
+This must run first because corrected lengths change the total distance count, which affects categorisation.
+
+**Stage 2: Categorisation** (batch, across all activities)
+
+Uses the corrected distances and lap data to classify each activity (see Categorisation section above). This must run before block extraction because we need the category's target distance.
+
+**Stage 3: Fastest Block Extraction** (per activity, triggered during categorisation pass 2)
+
+When a continuous swim's corrected distance exceeds its category target (e.g. 1550m in the 1500m bucket):
+1. Calculate how many lengths make up the target distance: `n = target / pool_length`.
+2. Slide a window of size `n` across the activity's already-corrected lengths.
+3. Pick the window with the lowest total duration (fastest block).
+4. Store only those lengths (re-indexed from 1) and update the activity's `total_distance_m`, `total_duration_s`, and derived stats.
+5. Preserve `raw_distance_m` as the original corrected distance before extraction.
 
 ### Error Handling Strategy
 
