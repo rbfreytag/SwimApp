@@ -2,7 +2,7 @@
 
 ## Overview
 
-A Dash web application for analysing swimming data from Garmin Connect. The app syncs activity data from Garmin, categorises sessions (continuous, interval, open water), corrects missed lane counts, and provides interactive visualisations for tracking pace, speed, and performance trends over time. The user can filter by date range, session category, and time of day, and toggle between different axis representations.
+A Dash web application for analysing swimming data from Garmin Connect. The app syncs activity data from Garmin, categorises sessions by distance and type (with configurable distance bucketing), corrects missed lane counts, and provides interactive visualisations for tracking pace, speed, and performance trends over time. The user can filter by date range, session category, and time of day, and toggle between different axis representations.
 
 ## Technical Stack
 
@@ -50,17 +50,22 @@ SwimApp/
 - `sync_activities() -> list[str]` — Connects to Garmin, compares remote activity list against `data/raw/`, downloads missing activities. Returns list of newly downloaded activity IDs. Reuses token caching from `tokens/`.
 
 #### processing.py
-- `categorise_activity(activity: dict) -> str` — Returns one of: `"continuous"`, `"interval"`, `"open_water"`. Heuristic based on activity type key, lap count, and stroke variation.
+- `categorise_activities(activities: list[dict]) -> None` — Two-pass categorisation. First pass: assign `"interval"`, `"open_water"`, or mark as continuous with a raw distance. Second pass: bucket all continuous swims by distance (see Categorisation section), assigning labels like `"1500m"`, `"1000m"`, or `"other"`. Updates each activity's category in the DB.
+- `extract_continuous_block(lengths: list[dict], target_distance: float, pool_length: float) -> list[dict]` — For activities where the continuous distance is close to but exceeds a target bucket (e.g. 1550m vs 1500m bucket), extract the fastest contiguous block of lengths that sum to the target distance. Returns the trimmed length list.
 - `correct_missed_lengths(lengths: list[dict], pool_length: float) -> list[dict]` — Detects lengths with duration > 1.7x the median, splits them into two lengths with half the duration each. Returns corrected list.
-- `process_activity(filepath: Path) -> dict` — Reads a raw JSON file, applies categorisation and correction, returns a flat dict ready for DB insertion.
-- `process_all_new(activity_ids: list[str]) -> int` — Processes specified activities into the DB. Returns count processed.
+- `process_activity(filepath: Path) -> dict` — Reads a raw JSON file, applies correction, returns a flat dict ready for DB insertion. Category is assigned later in the batch pass.
+- `process_all_new(activity_ids: list[str]) -> int` — Processes specified activities into the DB, then runs categorisation across all activities. Returns count processed.
 
 #### db.py
 - `init_db() -> None` — Creates the SQLite schema if it doesn't exist.
 - `get_activities(category: str | None, start_date: str | None, end_date: str | None) -> pd.DataFrame` — Query activity-level data with optional filters.
 - `get_lengths(activity_ids: list[str]) -> pd.DataFrame` — Query individual length records for given activities.
+- `get_categories() -> list[str]` — Return all distinct category values in the DB.
+- `get_activity_dates(category: str | None) -> list[str]` — Return all dates that have an activity, optionally filtered by category (for calendar highlighting).
 - `activity_exists(activity_id: str) -> bool` — Check if an activity is already processed.
 - `insert_activity(activity: dict, lengths: list[dict]) -> None` — Insert one activity and its lengths.
+- `update_activity_category(activity_id: str, category: str) -> None` — Update an activity's category.
+- `update_activity_lengths(activity_id: str, lengths: list[dict]) -> None` — Replace an activity's lengths (after block extraction).
 
 #### app.py
 - Dash layout and callbacks. No business logic — delegates to `db.py` for data and uses Plotly for charts.
@@ -76,9 +81,10 @@ SwimApp/
 | date | TEXT | ISO date (YYYY-MM-DD) |
 | start_time_local | TEXT | ISO datetime |
 | time_of_day_minutes | INTEGER | Minutes since midnight (for time-of-day analysis) |
-| category | TEXT | "continuous", "interval", "open_water" |
-| total_distance_m | REAL | Total distance in metres |
-| total_duration_s | REAL | Total duration in seconds |
+| category | TEXT | e.g. "1500m", "1000m", "interval", "open_water", "other" |
+| total_distance_m | REAL | Total distance in metres (after block extraction) |
+| total_duration_s | REAL | Total duration in seconds (after block extraction) |
+| raw_distance_m | REAL | Original total distance before block extraction |
 | avg_pace_100m | REAL | Average pace in seconds per 100m |
 | avg_speed_ms | REAL | Average speed in m/s |
 | avg_hr | REAL | Average heart rate (nullable) |
@@ -91,7 +97,7 @@ SwimApp/
 |---|---|---|
 | id | INTEGER PK | Auto-increment |
 | activity_id | TEXT FK | References activities |
-| length_index | INTEGER | 1-based position within the activity |
+| length_index | INTEGER | 1-based position within the activity (after extraction) |
 | distance_m | REAL | Length distance (typically 25 or 50) |
 | duration_s | REAL | Duration in seconds |
 | pace_100m | REAL | Pace in seconds per 100m |
@@ -101,11 +107,32 @@ SwimApp/
 | hr | REAL | Heart rate (nullable) |
 | is_corrected | BOOLEAN | True if this length was split from a missed count |
 
-### Categorisation Heuristic
+### Categorisation
 
+Categorisation is a two-pass process across all activities:
+
+**Pass 1 — Type classification:**
 1. If `activityType.typeKey == "open_water_swimming"` -> `"open_water"`
 2. If the activity has multiple Garmin laps with DRILL or MIXED stroke types -> `"interval"`
-3. Otherwise -> `"continuous"`
+3. Otherwise -> mark as continuous candidate with its raw distance
+
+**Pass 2 — Distance bucketing (continuous swims only):**
+1. Collect all continuous swim distances.
+2. Round each distance to the nearest `DISTANCE_MARGIN` (default: 50m, configurable via env var `SWIM_DISTANCE_MARGIN_M`).
+3. Group by rounded distance. Any group with >= `MIN_CATEGORY_COUNT` swims (default: 3, configurable via env var `SWIM_MIN_CATEGORY_COUNT`) becomes its own category, labelled by the target distance (e.g. `"1500m"`, `"1000m"`).
+4. Activities whose rounded distance falls in a valid bucket but whose raw distance exceeds the target: run `extract_continuous_block` to take the fastest contiguous block matching the target, then update the stored lengths and recalculate stats.
+5. Activities that don't fit any bucket -> `"other"`.
+
+**Example:** With margin=50m and min_count=3, if there are 40 swims at 1475-1550m, they all bucket to `"1500m"`. The 1550m swims get trimmed to the fastest 60 lengths (60 x 25m = 1500m). If there are only 2 swims at ~1000m, those go to `"other"` until a third appears.
+
+### Fastest Block Extraction
+
+When a continuous swim's distance exceeds its category target (e.g. 1550m in the 1500m bucket):
+1. Calculate how many lengths make up the target distance: `n = target / pool_length`.
+2. Slide a window of size `n` across the activity's corrected lengths.
+3. Pick the window with the lowest total duration (fastest block).
+4. Store only those lengths (re-indexed from 1) and update the activity's `total_distance_m`, `total_duration_s`, and derived stats.
+5. Preserve `raw_distance_m` as the original distance.
 
 ### Missed Length Correction
 
@@ -131,9 +158,6 @@ Set up `requirements.txt` with all dependencies. Implement `db.py` with schema c
 - [ ] `python -c "from db import init_db; init_db()"` creates `data/swim.db` with both tables
 - [ ] `python -c "from db import get_activities; print(get_activities())"` returns empty DataFrame with correct columns
 
-**Manual verification:**
-- [ ] Inspect `data/swim.db` schema with `sqlite3 data/swim.db '.schema'`
-
 ### Step 2: Sync module
 
 Refactor `download_swim_data.py` into `sync.py`. It should: authenticate (with token caching), fetch the full activity list filtered to swimming, check which activity IDs already have files in `data/raw/`, and download detailed data for any missing ones.
@@ -142,84 +166,87 @@ Refactor `download_swim_data.py` into `sync.py`. It should: authenticate (with t
 - [ ] `python -c "from sync import sync_activities; ids = sync_activities(); print(f'Synced {len(ids)} new')"` runs without error (may return 0 if all data is present)
 - [ ] All existing JSON files are accessible in `data/raw/`
 
-**Manual verification:**
-- [ ] Confirm `data/raw/` contains one JSON file per activity
-
 ### Step 3: Processing module (categorisation + correction)
 
-Implement `processing.py`. The `categorise_activity` function classifies based on the heuristic above. The `correct_missed_lengths` function applies the split logic. The `process_activity` function ties it together and returns data ready for DB insertion. `process_all_new` processes a batch into the DB.
+Implement `processing.py` with:
+- `correct_missed_lengths` — split anomalous lengths
+- `extract_continuous_block` — fastest block extraction for over-distance swims
+- `categorise_activities` — two-pass type + distance bucketing
+- `process_activity` / `process_all_new` — orchestration
 
 **Automated verification:**
-- [ ] `python -c "from processing import process_all_new; from db import init_db, get_activities; import os; init_db(); ids = [f.replace('.json','').split('_')[1] for f in os.listdir('data/raw') if f.startswith('swim_')]; n = process_all_new(ids); print(f'Processed {n}'); df = get_activities(); print(df[['date','category','total_distance_m','avg_pace_100m']].to_string())"` processes all activities and prints a table
-- [ ] Verify corrected lengths exist: `python -c "from db import get_lengths; df = get_lengths([]); print(f'Corrected: {df.is_corrected.sum()} of {len(df)}')"` shows some corrected lengths
+- [ ] Run processing on all existing data and print a category summary table:
+  ```
+  python -c "
+  from processing import process_all_new
+  from db import init_db, get_activities
+  import os
+  init_db()
+  ids = [f.split('_')[1] for f in os.listdir('data/raw') if f.startswith('swim_')]
+  n = process_all_new(ids)
+  df = get_activities()
+  print(df[['date','category','total_distance_m','raw_distance_m','avg_pace_100m']].to_string())
+  print()
+  print(df.groupby('category').size())
+  "
+  ```
+- [ ] Verify corrected lengths: `python -c "from db import get_lengths; df = get_lengths([]); print(f'Corrected: {df.is_corrected.sum()} of {len(df)}')"` shows some corrected lengths
+- [ ] Generate and push a verification chart showing the categorisation and correction results:
+  ```
+  python verify_processing.py
+  ```
+  This script (created as part of this step) produces `data/verify_processing.html` — a static Plotly chart with:
+  - Panel 1: all activities plotted by date, coloured by category, y-axis = distance
+  - Panel 2: length durations for the 2026-03-06 activity before/after correction (showing the 56s/55s splits)
 
-**Manual verification:**
-- [ ] Check that the 56s and 55s lengths in the 2026-03-06 activity got split into ~28s pairs
-- [ ] Confirm open_water_swimming activity (2025-07-24) is categorised as "open_water"
-- [ ] Confirm multi-lap drill sessions are categorised as "interval"
+  Commit and push this chart so it can be reviewed on GitHub or downloaded to phone.
 
 ### Step 4: Dash app layout
 
 Build the Dash app layout in `app.py` with:
 - **Sidebar** (left, ~300px):
-  - Date range picker (calendar-style)
-  - Category dropdown (All / Continuous / Interval / Open Water)
+  - Date range picker (calendar-style) — highlights dates that have activities in the selected category
+  - Category dropdown — dynamically populated from DB categories (e.g. "All", "1500m", "1000m", "interval", "open_water", "other")
   - View mode radio: "Performance Over Time" vs "Within-Swim Profile"
-  - X-axis toggle: Length # vs Elapsed Time
+  - X-axis toggle: Length # vs Elapsed Time (only visible in Within-Swim view)
   - Y-axis toggle: Pace (min:ss/100m) vs Speed (m/s)
   - Time-of-day filter: All / Morning (<12:00) / Afternoon (>=12:00)
+  - "Show average + deviation" toggle (only visible in Within-Swim view, off by default)
+  - "Top N fastest" input + button (only visible in Within-Swim view) — select the N fastest activities in the current category and plot them
 - **Main area** (right):
   - Graph (Plotly figure, full width)
-  - Stats panel below the graph: Average pace, Fastest length, Slowest length, Std deviation, Number of sessions
+  - Stats panel below the graph: Average pace, Fastest, Slowest, Std deviation, Number of sessions
 
 Add `assets/style.css` for basic layout styling.
 
 **Automated verification:**
-- [ ] `python app.py` starts without errors and serves on `http://localhost:8050`
-
-**Manual verification:**
-- [ ] Open browser, confirm sidebar controls are visible and the chart area is present
-- [ ] All dropdowns/toggles render and are clickable (no data needed yet)
+- [ ] `python app.py &` starts without errors and `curl -s http://localhost:8050 | head -20` returns HTML
 
 ### Step 5: Callbacks — Performance Over Time view
 
 Implement the "Performance Over Time" view. When selected:
 - X-axis: date
-- Y-axis: average pace or speed per session
-- Each dot is one swim session (filtered by category and date range)
+- Y-axis: average pace or speed per session (per y-axis toggle)
+- Each dot is one swim session (filtered by category, date range, time of day)
 - Add a trend line (rolling average, window=5)
 - Stats panel shows: overall average pace, fastest session, slowest session, std dev, count
+- Selecting a category highlights matching dates on the calendar
 
 **Automated verification:**
-- [ ] App loads and renders the chart with real data from the DB
-- [ ] Changing category dropdown updates the chart
-
-**Manual verification:**
-- [ ] Chart shows sessions over time with correct dates
-- [ ] Hovering shows date, pace, distance
-- [ ] Stats panel updates when filters change
-- [ ] Time-of-day filter correctly separates morning vs afternoon sessions
+- [ ] Generate a static version of the Performance Over Time chart for the "1500m" category and save as `data/verify_over_time.html`. Commit and push for review.
 
 ### Step 6: Callbacks — Within-Swim Profile view
 
 Implement the "Within-Swim Profile" view. When selected:
 - X-axis: length number (or elapsed time, per toggle)
 - Y-axis: pace or speed per length (per toggle)
-- If a single date is selected: show that swim as a single trace
-- If a date range is selected: show the average pace at each length position across all selected swims, with a shaded std deviation band
-- Each individual activity can also appear as a faint trace behind the average
+- **Default mode:** one trace per activity for all selected dates. Each trace labelled by date.
+- **Average mode** (toggled on): show the mean pace at each length position across selected swims, with a shaded std deviation band. Individual traces become faint behind the average.
+- **Top N mode:** when the user enters N and clicks the button, select the N fastest activities (by avg_pace_100m) from the current category and date range, and plot those as individual traces.
 - Stats panel shows: average pace, fastest length, slowest length, std dev across selected range
 
 **Automated verification:**
-- [ ] App renders within-swim chart with length-level data
-- [ ] Switching between length # and elapsed time on x-axis works
-
-**Manual verification:**
-- [ ] Single-swim view shows per-length pace variation
-- [ ] Multi-swim average view shows mean line with deviation band
-- [ ] X-axis toggle switches between length count and elapsed time
-- [ ] Y-axis toggle switches between pace (mm:ss) and speed (m/s)
-- [ ] Corrected lengths are visually indistinguishable from normal ones (no artefacts)
+- [ ] Generate a static version of the Within-Swim chart showing all "1500m" activities as individual traces, save as `data/verify_in_swim.html`. Commit and push for review.
 
 ### Step 7: Startup sync integration
 
@@ -234,15 +261,14 @@ Add a startup banner/log message showing sync results.
 - [ ] `python app.py` performs sync, processes new data, and starts the server
 - [ ] Running it a second time immediately shows "0 new activities" (no duplicate processing)
 
-**Manual verification:**
-- [ ] After adding a new swim on Garmin and restarting the app, the new activity appears in the chart
-
 ## Configuration
 
 | Variable | Source | Default | Description |
 |---|---|---|---|
 | `GARMIN_EMAIL` | `.env` | — | Garmin Connect email |
 | `GARMIN_PASSWORD` | `.env` | — | Garmin Connect password |
+| `SWIM_DISTANCE_MARGIN_M` | `.env` | `50` | Distance margin in metres for bucketing continuous swims into categories |
+| `SWIM_MIN_CATEGORY_COUNT` | `.env` | `3` | Minimum number of swims at a distance before it becomes its own category |
 | `DASH_DEBUG` | `.env` | `false` | Enable Dash debug mode |
 | `PORT` | `.env` | `8050` | Dash server port |
 
@@ -250,7 +276,6 @@ Add a startup banner/log message showing sync results.
 
 - FIT file download and parsing for stroke-level analysis (stroke rate curves, distance per stroke)
 - Export charts as PNG/PDF
-- Comparison mode: overlay two specific sessions side-by-side
 - SWOLF analysis view
 - Heart rate zone analysis per swim segment
 - Goal setting and progress tracking
