@@ -148,25 +148,20 @@ def categorise_activities() -> None:
     margin = DISTANCE_MARGIN
 
     # Group by nearest "clean" target distance.
-    # For each distance, find the nearest multiple of 100m. If within margin,
-    # assign to that bucket. Use floor-based rounding so 1550 -> 1500 (not 1600).
+    # Try progressively finer multiples (500, 100, 50) and pick the roundest
+    # target that is within margin of the distance.
     buckets: dict[float, list[tuple[str, float, float]]] = {}
     for activity_id, dist, pool_length in continuous_candidates:
-        # Try both floor and ceil multiples of 100
-        floor_target = (dist // 100) * 100
-        ceil_target = floor_target + 100
+        target = None
+        for step in [500, 100, 50]:
+            candidate = round(dist / step) * step
+            if abs(dist - candidate) <= margin:
+                target = candidate
+                break
+        if target is None:
+            target = dist
 
-        # Pick whichever is closer, preferring the lower one on ties
-        if abs(dist - floor_target) <= abs(dist - ceil_target):
-            target = floor_target
-        else:
-            target = ceil_target
-
-        if abs(dist - target) <= margin:
-            buckets.setdefault(target, []).append((activity_id, dist, pool_length))
-        else:
-            # Fallback: use exact distance as its own bucket
-            buckets.setdefault(dist, []).append((activity_id, dist, pool_length))
+        buckets.setdefault(target, []).append((activity_id, dist, pool_length))
 
     # Determine valid categories
     for bucket_target, items in buckets.items():
