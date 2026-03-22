@@ -4,4 +4,5 @@ __pycache__/
 *.pyc
 data/*
 !data/verify_*.html
+!data/verify_*.png
 tokens/
